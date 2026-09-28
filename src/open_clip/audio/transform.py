@@ -69,24 +69,58 @@ def float32_to_int16_torch(x: torch.Tensor) -> torch.Tensor:
     return (x * 32767.0).type(torch.int16)
 
 
-def _get_mel(audio_data: torch.Tensor, audio_cfg: Dict[str, Any]) -> torch.Tensor:
+_MEL_TRANSFORMS: Dict[Any, Any] = {}
+_RESAMPLE_KERNELS: Dict[Any, Any] = {}
+
+
+def _mel_transforms(audio_data: torch.Tensor, audio_cfg: Dict[str, Any]):
     import torchaudio
 
-    mel_tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=audio_cfg.get("sample_rate", 48000),
-        n_fft=audio_cfg.get("window_size", 1024),
-        win_length=audio_cfg.get("window_size", 1024),
-        hop_length=audio_cfg.get("hop_size", 480),
-        center=True,
-        pad_mode="reflect",
-        power=2.0,
-        norm=None,
-        n_mels=audio_cfg.get("mel_bins", 64),
-        f_min=audio_cfg.get("fmin", 50),
-        f_max=audio_cfg.get("fmax", 14000),
-    )
+    key = (audio_cfg.get("sample_rate", 48000), audio_cfg.get("window_size", 1024),
+           audio_cfg.get("hop_size", 480), audio_cfg.get("mel_bins", 64),
+           audio_cfg.get("fmin", 50), audio_cfg.get("fmax", 14000),
+           str(audio_data.device), audio_data.dtype)
+    pair = _MEL_TRANSFORMS.get(key)
+    if pair is None:
+        pair = (
+            torchaudio.transforms.MelSpectrogram(
+                sample_rate=audio_cfg.get("sample_rate", 48000),
+                n_fft=audio_cfg.get("window_size", 1024),
+                win_length=audio_cfg.get("window_size", 1024),
+                hop_length=audio_cfg.get("hop_size", 480),
+                center=True,
+                pad_mode="reflect",
+                power=2.0,
+                norm=None,
+                n_mels=audio_cfg.get("mel_bins", 64),
+                f_min=audio_cfg.get("fmin", 50),
+                f_max=audio_cfg.get("fmax", 14000),
+            ).to(device=audio_data.device, dtype=audio_data.dtype),
+            torchaudio.transforms.AmplitudeToDB(top_db=None),
+        )
+        _MEL_TRANSFORMS[key] = pair
+    return pair
+
+
+def _resample(waveform: torch.Tensor, orig_freq, new_freq) -> torch.Tensor:
+    import torchaudio
+
+    if int(orig_freq) == int(new_freq):
+        return waveform
+    key = (int(orig_freq), int(new_freq), waveform.dtype, str(waveform.device))
+    kernel = _RESAMPLE_KERNELS.get(key)
+    if kernel is None:
+        kernel = torchaudio.transforms.Resample(
+            orig_freq=int(orig_freq), new_freq=int(new_freq), dtype=waveform.dtype,
+        ).to(waveform.device)
+        _RESAMPLE_KERNELS[key] = kernel
+    return kernel(waveform)
+
+
+def _get_mel(audio_data: torch.Tensor, audio_cfg: Dict[str, Any]) -> torch.Tensor:
+    mel_tf, amplitude_to_db = _mel_transforms(audio_data, audio_cfg)
     mel = mel_tf(audio_data)
-    mel = torchaudio.transforms.AmplitudeToDB(top_db=None)(mel)
+    mel = amplitude_to_db(mel)
     return mel.T
 
 
@@ -99,7 +133,9 @@ class AudioPreprocess:
             data_fill: str = "repeatpad",
             data_trunc: str = "rand_trunc",
             int16_normalize: bool = False,
+            opt_2: bool = False,
     ):
+        self.opt_2 = opt_2
         self.cfg = _as_audio_cfg_dict(audio_cfg)
         self.data_fill = data_fill
         self.data_trunc = data_trunc
@@ -124,14 +160,23 @@ class AudioPreprocess:
             raise ValueError(f"Unsupported audio fill mode: {self.data_fill}")
         return waveform
 
-    def __call__(self, audio_data):
-        import torchaudio
+    def finalize_raw(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        waveform = _resample(item["waveform"], item["sr"], self.target_sr)
+        if self.int16_normalize:
+            waveform = int16_to_float32_torch(float32_to_int16_torch(waveform))
+        return {"waveform": self._fill_waveform(waveform), "longer": False}
 
+    def __call__(self, audio_data):
         waveform, sr = audio_data
         if waveform.ndim == 2 and waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
+        if self.opt_2 and self.data_trunc == "fusion" and not self.int16_normalize:
+            flat = waveform.squeeze(0)
+            out_len = -(-int(flat.numel()) * int(self.target_sr) // int(sr))
+            if out_len <= self.clip_samples:
+                return {"waveform": flat, "sr": int(sr), "longer": False, "raw": True}
         if sr != self.target_sr:
-            waveform = torchaudio.functional.resample(waveform, sr, self.target_sr)
+            waveform = _resample(waveform, sr, self.target_sr)
         waveform = waveform.squeeze(0)
         if self.int16_normalize:
             waveform = int16_to_float32_torch(float32_to_int16_torch(waveform))
@@ -180,7 +225,7 @@ class AudioPreprocess:
         else:
             waveform = self._fill_waveform(waveform)
             longer = False
-            if self.data_trunc == "fusion":
+            if self.data_trunc == "fusion" and not self.opt_2:
                 mel = _get_mel(waveform, self.cfg)
                 result["mel_fusion"] = torch.stack([mel, mel, mel, mel], dim=0)
 
@@ -189,14 +234,82 @@ class AudioPreprocess:
         return result
 
 
+class Opt1:
+
+    def __init__(self, audio_cfg, device, one_channel: bool = True,
+                 data_fill: str = "repeatpad"):
+        import torchaudio
+        cfg = _as_audio_cfg_dict(audio_cfg)
+        self.device = torch.device(device)
+        self.one_channel = one_channel
+        self.data_fill = data_fill
+        self.sample_rate = cfg.get("sample_rate", 48000)
+        self.clip_samples = cfg.get("clip_samples", 480000)
+        self._kernels = {}
+        self.mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=cfg.get("sample_rate", 48000),
+            n_fft=cfg.get("window_size", 1024),
+            win_length=cfg.get("window_size", 1024),
+            hop_length=cfg.get("hop_size", 480),
+            center=True, pad_mode="reflect", power=2.0, norm=None,
+            n_mels=cfg.get("mel_bins", 64),
+            f_min=cfg.get("fmin", 50), f_max=cfg.get("fmax", 14000),
+        ).to(self.device)
+        self.db = torchaudio.transforms.AmplitudeToDB(top_db=None).to(self.device)
+
+    def _resample_fill(self, waveform, sr):
+        """The stock resample + repeat-pad, for the whole batch at once."""
+        import torchaudio
+
+        sr = int(sr)
+        if sr != self.sample_rate:
+            kernel = self._kernels.get(sr)
+            if kernel is None:
+                kernel = torchaudio.transforms.Resample(
+                    orig_freq=sr, new_freq=self.sample_rate, dtype=waveform.dtype,
+                ).to(self.device)
+                self._kernels[sr] = kernel
+            waveform = kernel(waveform)
+        n = waveform.shape[-1]
+        if n > self.clip_samples:
+            return waveform[..., :self.clip_samples]
+        if self.data_fill == "repeat":
+            reps = -(-self.clip_samples // n)
+            return waveform.repeat(1, reps)[..., :self.clip_samples]
+        if self.data_fill == "repeatpad":
+            reps = self.clip_samples // n
+            if reps > 1:
+                waveform = waveform.repeat(1, reps)
+        return torch.nn.functional.pad(waveform, (0, self.clip_samples - waveform.shape[-1]))
+
+    def __call__(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Add `mel_fusion` to a collated audio batch that deferred it."""
+        if "mel_fusion" in batch or "waveform" not in batch:
+            return batch
+        waveform = batch["waveform"]
+        if waveform.device != self.device:
+            waveform = waveform.to(self.device, non_blocking=True)
+        if batch.get("raw"):
+            waveform = self._resample_fill(waveform, batch["sr"])
+        mel = self.db(self.mel(waveform)).transpose(-1, -2)          # (B, frames, mels)
+        longer = batch.get("longer")
+        chans = 1 if (self.one_channel and (longer is None or not bool(longer.any()))) else 4
+        batch = dict(batch)
+        batch["waveform"] = waveform
+        batch["mel_fusion"] = mel.unsqueeze(1).expand(-1, chans, -1, -1).contiguous()
+        return batch
+
+
 def make_audio_preprocess(
         audio_cfg: Union[CLIPAudioCfg, Dict[str, Any]],
         data_fill: str = "repeatpad",
         data_trunc: str = "rand_trunc",
         int16_normalize: bool = False,
+        opt_2: bool = False,
 ):
     return AudioPreprocess(
         audio_cfg,
+        opt_2=opt_2,
         data_fill=data_fill,
         data_trunc=data_trunc,
         int16_normalize=int16_normalize,
@@ -207,6 +320,7 @@ def audio_transform_v2(
         audio_cfg: Union[CLIPAudioCfg, Dict[str, Any]],
         is_train: bool = False,
         audio_aug_cfg: Union[AudioAugmentationCfg, Dict[str, Any], None] = None,
+        opt_2: bool = False,
 ):
     cfg = _as_audio_cfg_dict(audio_cfg)
     if isinstance(audio_aug_cfg, dict):
@@ -221,6 +335,7 @@ def audio_transform_v2(
 
     return make_audio_preprocess(
         cfg,
+        opt_2=opt_2,
         # Eval and train now share the fill policy; eval previously hardcoded zero-padding.
         data_fill=audio_aug_cfg.data_fill,
         data_trunc=data_trunc,

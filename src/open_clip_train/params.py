@@ -145,11 +145,14 @@ def parse_args(args):
     parser.add_argument(
         "--audio-zeroshot-workers",
         type=int,
-        default=0,
-        help=(
-            "DataLoader workers for Hugging Face audio zero-shot eval. Defaults to 0 until multiprocessing "
-            "contexts are tested more broadly."
-        ),
+        default=-1,
+        help="DataLoader workers for Hugging Face audio zero-shot eval. -1 (default) follows --workers; 0 loads in the main process.",
+    )
+    parser.add_argument(
+        "--audio-zeroshot-opt-1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Optimized audio zero-shot preprocessing (default: on). --no-audio-zeroshot-opt-1 keeps the stock per-clip transform.",
     )
     parser.add_argument(
         "--audio-zeroshot-multiprocessing-context",

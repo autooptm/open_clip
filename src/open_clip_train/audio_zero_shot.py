@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 
 from open_clip import build_zero_shot_classifier, get_tokenizer
-from open_clip.audio.transform import audio_transform_v2, create_dummy_audio, stack_audio_inputs
+from open_clip.audio.transform import Opt1, audio_transform_v2, create_dummy_audio, stack_audio_inputs
 from open_clip.task import get_model_from_task
 from open_clip.utils import move_to_device
 from open_clip_train.precision import get_autocast
@@ -104,6 +104,19 @@ def _prepare_audio(model_or_task, audio, device, input_dtype=None):
     return move_to_device(audio, device, input_dtype)
 
 
+_OPT_4 = {}
+
+
+def _opt_3(model_or_task, device, data_fill="repeatpad"):
+    model = get_model_from_task(model_or_task)
+    key = (id(model), str(device), data_fill)
+    opt_5 = _OPT_4.get(key)
+    if opt_5 is None:
+        opt_5 = Opt1(model.audio.cfg, device, data_fill=data_fill)
+        _OPT_4[key] = opt_5
+    return opt_5
+
+
 def _create_dummy_audio(model_or_task, device, input_dtype=None):
     if hasattr(model_or_task, "create_dummy_batch"):
         return model_or_task.create_dummy_batch(batch_size=1, device=device, dtype=input_dtype)["audio"]
@@ -175,6 +188,21 @@ class HFAudioClassificationDataset(Dataset):
         }
 
 
+def _collate_audio_raw(batch: Sequence[Dict], preprocess=None):
+    audios = [sample["audio"] for sample in batch]
+    target = torch.as_tensor([sample["target"] for sample in batch], dtype=torch.long)
+    if any(a.get("raw") for a in audios):
+        rates = {int(a["sr"]) for a in audios if a.get("raw")}
+        lengths = {int(a["waveform"].numel()) for a in audios}
+        if len(rates) == 1 and len(lengths) == 1 and all(a.get("raw") for a in audios):
+            return {"audio": {"waveform": torch.stack([a["waveform"] for a in audios]),
+                              "longer": torch.zeros(len(audios), dtype=torch.bool),
+                              "sr": rates.pop(), "raw": True},
+                    "target": target}
+        audios = [preprocess.finalize_raw(a) if a.get("raw") else a for a in audios]
+    return {"audio": stack_audio_inputs(audios), "target": target}
+
+
 def _collate_audio_zero_shot(batch: Sequence[Dict]):
     return {
         "audio": stack_audio_inputs([sample["audio"] for sample in batch]),
@@ -232,8 +260,12 @@ def build_hf_audio_zero_shot_dataset(args, model_or_task):
             "enable_fusion": getattr(args, "audio_fusion", False),
             "int16_normalize": getattr(args, "audio_int16_normalize", False),
         }
-        transform = audio_transform_v2(model.audio.cfg, is_train=False, audio_aug_cfg=audio_aug_cfg)
-        collate_fn = _collate_audio_zero_shot
+        opt_2 = bool(getattr(args, "audio_zeroshot_opt_1", False)) and \
+            str(getattr(args, "device", "cpu")).startswith("cuda")
+        transform = audio_transform_v2(model.audio.cfg, is_train=False,
+                                       audio_aug_cfg=audio_aug_cfg, opt_2=opt_2)
+        collate_fn = (partial(_collate_audio_raw, preprocess=transform) if opt_2
+                      else _collate_audio_zero_shot)
     wrapped = HFAudioClassificationDataset(
         dataset,
         transform,
@@ -242,6 +274,8 @@ def build_hf_audio_zero_shot_dataset(args, model_or_task):
         target_map=target_map,
     )
     num_workers = getattr(args, "audio_zeroshot_workers", 0)
+    if num_workers is not None and int(num_workers) < 0:
+        num_workers = int(getattr(args, "workers", 0) or 0)
     loader_kwargs = {}
     if num_workers > 0:
         loader_kwargs["multiprocessing_context"] = getattr(
@@ -250,6 +284,8 @@ def build_hf_audio_zero_shot_dataset(args, model_or_task):
             "forkserver",
         )
         loader_kwargs["persistent_workers"] = True
+    _logger.info("Audio zero-shot supply: %s, %d loader worker(s), batch %d.",
+                 "optimized" if opt_2 else "stock", num_workers, args.batch_size)
     dataloader = DataLoader(
         wrapped,
         batch_size=args.batch_size,
@@ -263,8 +299,17 @@ def build_hf_audio_zero_shot_dataset(args, model_or_task):
 
 
 def run_audio_zero_shot_classifier(model, classifier, dataloader, args, use_fsdp_eval=False):
+    opt_5 = None
+
     def prepare(batch, device, dtype):
-        return _prepare_audio(model, batch["audio"], device, dtype), batch["target"].to(device, non_blocking=True)
+        nonlocal opt_5
+        audio = _prepare_audio(model, batch["audio"], device, dtype)
+        if isinstance(audio, dict) and "mel_fusion" not in audio and "waveform" in audio:
+            if opt_5 is None:
+                opt_5 = _opt_3(model, device,
+                                       getattr(args, "audio_fill", "repeatpad"))
+            audio = opt_5(audio)
+        return audio, batch["target"].to(device, non_blocking=True)
 
     return run_classification_eval(
         model, classifier, dataloader, args, input_key="audio", prepare_batch=prepare,

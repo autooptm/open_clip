@@ -1,3 +1,62 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>open_clip · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>5.82x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-5.82x-2ea44f"></a>
+    <a href="https://github.com/mlfoundations/open_clip/commit/2d5346092bf447ff73a782d372a8e018fb269ffc"><img alt="base" src="https://img.shields.io/badge/upstream-2d5346092bf4-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%205090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [mlfoundations/open_clip](https://github.com/mlfoundations/open_clip) at commit
+> [`2d5346092bf4`](https://github.com/mlfoundations/open_clip/commit/2d5346092bf447ff73a782d372a8e018fb269ffc) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python -m open_clip_train.main --model CLAP-HTSAT-tiny-Roberta-base-fused --pretrained laion --audio-zeroshot-dataset ashraq/esc50 --audio-zeroshot-split train --batch-size 64 --workers 4 --device cuda --zeroshot-frequency 1` |
+| **Entry point** | `src/open_clip_train/main.py` |
+| **Unit measured** | one batch of 64 ESC-50 clips through CLAP zero-shot classification (decoded audio → log-mel → audio tower → class scores) |
+| **Before (stock)** | 1.928 s per unit (59.78 s for the 31-batch eval loop) |
+| **After (this tree, all switches default ON)** | 0.3316 s per unit (10.28 s for the 31-batch eval loop) |
+| **Speedup** | **5.82x** end to end, noise floor of the host 0.63% |
+| **Output** | ESC-50 zero-shot top-1 87.85% / top-5 98.85%, identical to the stock program; verified on the pinned inputs and on a held-out set the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `src/open_clip/audio/transform.py` | AudioPreprocess.__call__ / finalize_raw, and a new class | 15.41x |
+| `src/open_clip/audio/transform.py` | the new class's __call__ | 1.1x |
+| `src/open_clip/audio/transform.py` | new helpers used by _get_mel and AudioPreprocess.__call__ | 1.075x |
+| `src/open_clip_train/audio_zero_shot.py` | build_hf_audio_zero_shot_dataset / _collate_audio_raw (new) / run_audio_zero_shot_classifier.prepare | with the first row |
+| `src/open_clip_train/params.py` | argument defaults | 1.93x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/open_clip-ao.git
+cd open_clip-ao
+# set up exactly as upstream documents, then:
+python -m open_clip_train.main --model CLAP-HTSAT-tiny-Roberta-base-fused --pretrained laion --audio-zeroshot-dataset ashraq/esc50 --audio-zeroshot-split train --batch-size 64 --workers 4 --device cuda --zeroshot-frequency 1
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 2d5346092bf4` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # OpenCLIP
 
 [[Paper]](https://arxiv.org/abs/2212.07143) [[Citations]](#citing) [[Clip Colab]](https://colab.research.google.com/github/mlfoundations/open_clip/blob/master/docs/Interacting_with_open_clip.ipynb) [[Coca Colab]](https://colab.research.google.com/github/mlfoundations/open_clip/blob/master/docs/Interacting_with_open_coca.ipynb)
